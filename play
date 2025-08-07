@@ -1,0 +1,825 @@
+import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import '/guest_mode.dart';
+import 'already_guessed.dart';
+import 'correct_guess.dart';
+import 'incorrect_guess.dart';
+import 'game_over.dart';
+import '/services/guest_progress_manager.dart';
+import '/services/guest_stats_manager.dart';
+
+class Play extends StatefulWidget {
+  final int? startingAttempts;
+  final int? startingHintsUsed;
+  final List<Map<String, bool>>? previousAttemptsList;
+  final String? retryInput1;
+  final String? retryInput2;
+  final bool? word1Correct;
+  final bool? word1SynonymCorrect;
+  final bool? word2Correct;
+  final bool? word2SynonymCorrect;
+  final DateTime? archiveDate;
+
+  const Play({
+    Key? key,
+    this.startingAttempts = 3,
+    this.startingHintsUsed = 0,
+    this.previousAttemptsList,
+    this.retryInput1,
+    this.retryInput2,
+    this.word1Correct,
+    this.word1SynonymCorrect,
+    this.word2Correct,
+    this.word2SynonymCorrect,
+    this.archiveDate
+  }) : super(key: key);
+
+  @override
+  _PlayScreenState createState() => _PlayScreenState();
+}
+
+class _PlayScreenState extends State<Play> {
+  final TextEditingController _userInput1Controller = TextEditingController();
+  final TextEditingController _userInput2Controller = TextEditingController();
+  final FocusNode _input1FocusNode = FocusNode();
+  final FocusNode _input2FocusNode = FocusNode();
+  final FocusNode _input3FocusNode = FocusNode();
+  final FocusNode _input4FocusNode = FocusNode();
+  final supabase = Supabase.instance.client;
+
+  int attempts = 3;
+  int hintsUsed = 0;
+  String? wordPairId;
+  bool hintUsedPreviously = false;
+  int maxHintsUsed = 0;
+  bool get isArchivePlay => widget.archiveDate != null;
+
+  List<List<String>> correctWords = [[], []];
+  List<String> displayedSynonyms = [];
+  List<Map<String, bool>> attemptsList = [];
+
+  get floatingActionButton => null;
+
+  @override
+  void initState() {
+    super.initState();
+    attempts = widget.startingAttempts ?? 3;
+    hintsUsed = widget.startingHintsUsed ?? 0;
+    attemptsList = widget.previousAttemptsList ?? [];
+    _fetchWordPair();
+  }
+
+  @override
+  void dispose() {
+    _userInput1Controller.dispose();
+    _userInput2Controller.dispose();
+    _input1FocusNode.dispose();
+    _input2FocusNode.dispose();
+    super.dispose();
+  }
+
+  Future<void> _storeHintUsage() async {
+    final now = DateTime.now();
+    final todayStr = now.toIso8601String().substring(0, 10);
+    final start = DateTime(now.year, now.month, now.day);
+    final end = start.add(Duration(days: 1)).subtract(Duration(seconds: 1));
+    final user = supabase.auth.currentUser;
+
+    final prefs = await SharedPreferences.getInstance();
+    final key = 'extra_hints_used_${user?.id ?? 'guest'}_$todayStr';
+    await prefs.setBool(key, true);
+
+    if (user != null) {
+      try {
+        await supabase.from('user_guesses')
+            .update({'hints_used': true})
+            .eq('user_id', user.id)
+            .gte('timestamp', start.toIso8601String())
+            .lte('timestamp', end.toIso8601String());
+      } catch (e) {
+        print('Failed to update hints_used: $e');
+      }
+    }
+  }
+
+  Future<void> _fetchWordPair() async {
+    try {
+      print("Fetching today's word pair...");
+      final targetDate = isArchivePlay ? widget.archiveDate! : DateTime.now();
+      final targetDateOnly = "${targetDate.year.toString().padLeft(4, '0')}-${targetDate.month.toString().padLeft(2, '0')}-${targetDate.day.toString().padLeft(2, '0')}";
+
+      final response = await supabase
+          .from('word_pairs')
+          .select()
+          .eq('date_available', targetDateOnly)
+          .maybeSingle();
+
+      print('Response from word_pairs: $response');
+
+      if (response == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("No word pair available for today.")),
+        );
+        return;
+      }
+
+      final cw = [
+        [
+          response['word1'] as String,
+          response['word1_synonym1'] as String,
+          response['word1_synonym2'] as String
+        ],
+        [
+          response['word2'] as String,
+          response['word2_synonym1'] as String,
+          response['word2_synonym2'] as String
+        ]
+      ];
+
+      final currentWordPairId = response['id'] as String?;
+      print('Fetched wordPairId: $currentWordPairId');
+
+      final userId = await getUserId();
+
+      if (GuestMode.isGuest) {
+        final savedProgress = await GuestProgressManager.loadProgress();
+
+        if (savedProgress != null && savedProgress['wordPairId'] == currentWordPairId) {
+          final isSolved = savedProgress['isSolved'] as bool;
+          final attemptsListLoaded = (savedProgress['attemptsList'] as List)
+              .map<Map<String, bool>>((e) => Map<String, bool>.from(e))
+              .toList();
+          final hintsUsedLoaded = savedProgress['hintsUsed'] as int;
+
+          correctWords = cw;
+
+          // If user has used all attempts and still not solved -> Game Over
+          if (attemptsListLoaded.length >= 3 && !isSolved) {
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(
+                builder: (context) => GameOverScreen(
+                  word1: cw[0][0],
+                  word2: cw[1][0],
+                  attempts: attemptsListLoaded,
+                  hintsUsed: hintsUsedLoaded,
+                ),
+              ),
+            );
+            return;
+          }
+
+          // Update state with saved progress
+          setState(() {
+            wordPairId = currentWordPairId;
+            correctWords = cw;
+            attemptsList = attemptsListLoaded;
+            hintsUsed = hintsUsedLoaded;
+            attempts = 3 - attemptsList.length;
+            hintUsedPreviously = hintsUsed > 0;
+            displayedSynonyms = hintUsedPreviously
+                ? ['${cw[0][1]} and ${cw[0][2]}', '${cw[1][1]} and ${cw[1][2]}']
+                : [cw[0][2], cw[1][2]];
+          });
+
+          // Autofill correct guesses in inputs
+          for (final attempt in attemptsListLoaded.reversed) {
+            if (attempt['word1_status'] == true) {
+              _userInput1Controller.text = cw[0][0];
+            }
+            if (attempt['word2_status'] == true) {
+              _userInput2Controller.text = cw[1][0];
+            }
+            if (attempt['word1_status'] == true && attempt['word2_status'] == true) {
+              break;
+            }
+          }
+
+          // Only navigate to AlreadyGuessed if user has solved puzzle
+          if (isSolved) {
+            Navigator.pushReplacementNamed(
+              context,
+              '/already_guessed',
+              arguments: {
+                'word1': correctWords[0][0],
+                'word2': correctWords[1][0],
+                'attemptsList': attemptsListLoaded,
+                'hintUsed': hintUsedPreviously,
+                'attempts': attempts,
+                'hintsUsed': hintsUsed,
+              },
+            );
+            return;
+          }
+        } else {
+          // No saved progress - fresh play
+          setState(() {
+            wordPairId = currentWordPairId;
+            correctWords = cw;
+            attempts = 3;
+            hintsUsed = 0;
+            attemptsList = [];
+            displayedSynonyms = [cw[0][2], cw[1][2]];
+            hintUsedPreviously = false;
+            _userInput1Controller.clear();
+            _userInput2Controller.clear();
+          });
+        }
+      }
+
+
+
+      // Logged-in user logic (unchanged)
+      if (userId != null && currentWordPairId != null && !GuestMode.isGuest) {
+        final guessResponse = await supabase
+            .from('user_guesses')
+            .select()
+            .eq('user_id', userId)
+            .eq('word_pair_id', currentWordPairId)
+            .order('attempt_number', ascending: true);
+
+        final guesses = guessResponse as List<dynamic>;
+        print('Guesses fetched from DB: $guesses');
+
+        maxHintsUsed = 0;
+        if (guesses.isNotEmpty) {
+          maxHintsUsed = guesses
+              .map((g) => g['hints_used'] ?? 0)
+              .reduce((a, b) => a > b ? a : b);
+        }
+
+        // Check local storage hint flag if no hints found in DB
+        final prefs = await SharedPreferences.getInstance();
+        final hintFlagKey = 'extra_hints_used_${userId}_$targetDateOnly';
+        final hintFlag = prefs.getBool(hintFlagKey) ?? false;
+
+        if (maxHintsUsed == 0 && hintFlag) {
+          maxHintsUsed = 1;
+        }
+
+        print('Fetched hintsUsed from DB/local: $maxHintsUsed');
+
+        bool solvedAlready = guesses.any((g) =>
+        g['word1_status'] == 'correct' && g['word2_status'] == 'correct');
+
+        if (solvedAlready) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (context) => AlreadyGuessed(
+                word1: correctWords[0][0],
+                word2: correctWords[1][0],
+                attemptsList: attemptsList,
+                hintUsed: hintUsedPreviously,
+                attempts: attempts,
+                hintsUsed: hintsUsed ?? 0,
+              ),
+            ),
+          );
+        }
+
+        Map<String, dynamic>? lastCorrectGuess;
+        try {
+          lastCorrectGuess = guesses.lastWhere((g) =>
+          g['word1_status'] == 'correct' || g['word2_status'] == 'correct');
+        } catch (e) {
+          lastCorrectGuess = null;
+        }
+
+        setState(() {
+          wordPairId = currentWordPairId;
+          correctWords = cw;
+          attempts = 3 - guesses.length;
+          attemptsList = guesses
+              .map((g) => <String, bool>{
+            'word1_status': g['word1_status'] == 'correct',
+            'word1_synonym_status': g['word1_status'] == 'synonym',
+            'word2_status': g['word2_status'] == 'correct',
+            'word2_synonym_status': g['word2_status'] == 'synonym',
+          })
+              .toList();
+          hintsUsed = maxHintsUsed;
+          hintUsedPreviously = maxHintsUsed > 0;
+
+          displayedSynonyms = hintUsedPreviously
+              ? ['${cw[0][1]} and ${cw[0][2]}', '${cw[1][1]} and ${cw[1][2]}']
+              : [cw[0][2], cw[1][2]];
+
+          if (lastCorrectGuess != null) {
+            if (lastCorrectGuess['word1_status'] == 'correct') {
+              _userInput1Controller.text = cw[0][0];
+            }
+            if (lastCorrectGuess['word2_status'] == 'correct') {
+              _userInput2Controller.text = cw[1][0];
+            }
+          }
+        });
+
+        if (guesses.length >= 3) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (context) => GameOverScreen(
+                word1: cw[0][0],
+                word2: cw[1][0],
+                attempts: attemptsList,
+                hintsUsed: maxHintsUsed,
+              ),
+            ),
+          );
+          return;
+        }
+      }
+    } catch (error) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Error fetching word pair: $error")),
+      );
+    }
+  }
+
+  Future<String?> getUserId() async {
+    final user = supabase.auth.currentUser;
+    if (user != null) {
+      GuestMode.isGuest = false;
+      return user.id;
+    } else {
+      GuestMode.isGuest = true;
+      return await GuestMode.getGuestId();
+    }
+  }
+
+  Future<void> _submitGuess() async {
+    String input1 = _userInput1Controller.text.trim().toLowerCase();
+    String input2 = _userInput2Controller.text.trim().toLowerCase();
+
+    if (correctWords[0].isEmpty || correctWords[1].isEmpty || wordPairId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Words not loaded yet. Please wait.")),
+      );
+      return;
+    }
+
+    List<String> userGuess = [input1, input2];
+    List<String> guessResults = [];
+
+    for (int i = 0; i < userGuess.length; i++) {
+      String guess = userGuess[i];
+      List<String> correctGroup = correctWords[i];
+
+      if (guess == correctGroup[0]) {
+        guessResults.add('correct');
+      } else if (correctGroup.contains(guess)) {
+        guessResults.add('synonym');
+      } else {
+        guessResults.add('wrong');
+      }
+    }
+
+    attemptsList.add(<String, bool>{
+      'word1_status': guessResults[0] == 'correct',
+      'word1_synonym_status': guessResults[0] == 'synonym',
+      'word2_status': guessResults[1] == 'correct',
+      'word2_synonym_status': guessResults[1] == 'synonym',
+    });
+
+    final isSolved = guessResults[0] == 'correct' && guessResults[1] == 'correct';
+
+    if (!isArchivePlay && GuestMode.isGuest && wordPairId != null) {
+      await GuestProgressManager.saveProgress(
+        wordPairId: wordPairId!,
+        attemptsList: attemptsList,
+        hintsUsed: hintsUsed,
+        isSolved: isSolved,
+      );
+    }
+
+    final userId = await getUserId();
+
+    if (userId == null || wordPairId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("User or word data missing.")),
+      );
+      return;
+    }
+
+    // For logged in users, save guess to Supabase, but NOT if archive play
+    if (!GuestMode.isGuest && !isArchivePlay) {
+      try {
+        print('Saving guess with hintsUsed: $hintsUsed');
+        await supabase.from('user_guesses').insert({
+          'user_id': userId,
+          'word_pair_id': wordPairId!,
+          'attempt_number': 4 - attempts,
+          'word1_status': guessResults[0],
+          'word2_status': guessResults[1],
+          'hints_used': hintsUsed,
+          'timestamp': DateTime.now().toIso8601String(),
+        });
+      } catch (error) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Error saving guess: $error")),
+        );
+      }
+    }
+
+    if (isSolved) {
+      if (!isArchivePlay && GuestMode.isGuest) {
+        await GuestStatsManager.updateStats(
+          attemptsTaken: 4 - attempts,
+          solved: true,
+        );
+      }
+
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (context) => CorrectGuessScreen(
+            attempts: 4 - attempts,
+            attemptsList: attemptsList,
+            hintsUsed: hintsUsed,
+            word1: correctWords[0][0],
+            word2: correctWords[1][0],
+          ),
+        ),
+      );
+      return; // important to stop further execution
+    }
+
+    // Not solved case:
+    setState(() {
+      attempts--;
+    });
+
+    if (attempts <= 0) {
+      if (!isArchivePlay && GuestMode.isGuest) {
+        await GuestStatsManager.updateStats(
+          attemptsTaken: -1,
+          solved: false,
+        );
+      }
+
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (context) => GameOverScreen(
+            word1: correctWords[0][0],
+            word2: correctWords[1][0],
+            attempts: attemptsList,
+            hintsUsed: hintsUsed,
+          ),
+        ),
+      );
+      return; // important to stop further execution
+    }
+
+    // attempts > 0, allow retry via IncorrectGuess screen
+    final result = await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => IncorrectGuess(
+          userInput1: input1,
+          userInput2: input2,
+          word1Correct: guessResults[0] == 'correct',
+          word1SynonymCorrect: guessResults[0] == 'synonym',
+          word2Correct: guessResults[1] == 'correct',
+          word2SynonymCorrect: guessResults[1] == 'synonym',
+        ),
+      ),
+    );
+
+    if (result is Map && result['action'] == 'hint') {
+      setState(() {
+        hintsUsed = (hintsUsed ?? 0) + 1;
+        hintUsedPreviously = true;
+
+        displayedSynonyms = [
+          '${correctWords[0][1]} and ${correctWords[0][2]}',
+          '${correctWords[1][1]} and ${correctWords[1][2]}',
+        ];
+
+        if (result['word1Correct'] == true &&
+            (result['retryInput1']?.isNotEmpty ?? false)) {
+          _userInput1Controller.text = result['retryInput1'];
+        } else {
+          _userInput1Controller.clear();
+        }
+        if (result['word2Correct'] == true &&
+            (result['retryInput2']?.isNotEmpty ?? false)) {
+          _userInput2Controller.text = result['retryInput2'];
+        } else {
+          _userInput2Controller.clear();
+        }
+      });
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (_userInput1Controller.text.isEmpty) {
+          FocusScope.of(context).requestFocus(_input1FocusNode);
+        } else if (_userInput2Controller.text.isEmpty) {
+          FocusScope.of(context).requestFocus(_input2FocusNode);
+        }
+      });
+
+      if (GuestMode.isGuest && wordPairId != null) {
+        await GuestProgressManager.saveProgress(
+          wordPairId: wordPairId!,
+          attemptsList: attemptsList,
+          hintsUsed: hintsUsed,
+          isSolved: false,
+        );
+      }
+    }
+  }
+
+
+
+  void _showHowToPlay(BuildContext context) {
+    final theme = Theme.of(context);
+    final textColor = theme.colorScheme.onBackground;
+    final titleColor = theme.colorScheme.primary;
+
+    showDialog(
+      context: context,
+      builder: (context) => Dialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Text(
+                  '🎯 How to Play',
+                  style: TextStyle(
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                    color: textColor,
+                  ),
+                ),
+              ),
+              SizedBox(height: 20),
+              _howToItem('🧠', Text('You’ll get two clues.', style: TextStyle(color: textColor, fontSize: 18))),
+              _howToItem('🔍', Text('Guess the rhyming words that match those clues.', style: TextStyle(color: textColor, fontSize: 18))),
+              _howToItem('🔄', RichText(
+                text: TextSpan(
+                  style: TextStyle(color: textColor, fontSize: 18),
+                  children: [
+                    TextSpan(text: 'You have '),
+                    TextSpan(text: '3 tries', style: TextStyle(fontWeight: FontWeight.bold)),
+                    TextSpan(text: ' per day. Use them wisely!'),
+                  ],
+                ),
+              )),
+              SizedBox(height: 20),
+              Text(
+                '📌 Example:',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 22,
+                  color: textColor,
+                ),
+              ),
+              SizedBox(height: 8),
+              Padding(
+                padding: const EdgeInsets.only(left: 12),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('• Clue 1: Rock', style: TextStyle(color: textColor, fontSize: 18)),
+                    Text('• Clue 2: Chair', style: TextStyle(color: textColor, fontSize: 18)),
+                    SizedBox(height: 4),
+                    Text(
+                      'Answer: Stone Throne',
+                      style: TextStyle(
+                        fontStyle: FontStyle.italic,
+                        fontSize: 18,
+                        color: textColor,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(height: 30),
+              Center(
+                child: ElevatedButton.icon(
+                  icon: Icon(Icons.check),
+                  label: Text('Got it!'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: titleColor,
+                    foregroundColor: Colors.white,
+                    padding: EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10)),
+                  ),
+                  onPressed: () => Navigator.of(context).pop(),
+                ),
+              )
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _howToItem(String emoji, Widget content) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(emoji, style: TextStyle(fontSize: 20)),
+          SizedBox(width: 8),
+          Expanded(child: content),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final textColor = theme.textTheme.bodyLarge?.color ?? Colors.black;
+
+    return GestureDetector(
+        onTap: () => FocusScope.of(context).unfocus(),
+        child: Scaffold(
+          appBar: AppBar(
+            title: Text('RhymeIt'),
+            centerTitle: true,
+          ),
+          body: Padding(
+            padding: EdgeInsets.all(20),
+            child: correctWords[0].isEmpty
+                ? Center(child: CircularProgressIndicator())
+                : Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  "Find the rhyming words that match the clues:",
+                  style: theme.textTheme.headlineMedium?.copyWith(color: textColor),
+                  textAlign: TextAlign.center,
+                ),
+            const SizedBox(height: 24),
+
+            // Centered synonym of word 1
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Text(
+                  "Clue for word 1:",
+                  style: theme.textTheme.titleMedium?.copyWith(color: textColor),
+                  textAlign: TextAlign.center,
+                ),
+                Text(
+                  displayedSynonyms[0],
+                  style: theme.textTheme.titleLarge?.copyWith(color: textColor),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 12),
+
+            // Centered synonym of word 2
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Text(
+                  "Clue for word 2:",
+                  style: theme.textTheme.titleMedium?.copyWith(color: textColor),
+                  textAlign: TextAlign.center,
+                ),
+                Text(
+                  displayedSynonyms[1],
+                  style: theme.textTheme.titleLarge?.copyWith(color: textColor),
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 24),
+            Container(
+              width: double.infinity,
+              height: 24,
+              decoration: BoxDecoration(
+                color: attempts == 3
+                    ? Colors.green
+                    : attempts == 2
+                    ? Colors.orange
+                    : Colors.red,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              alignment: Alignment.center,
+              child: Text(
+                "Chances left: $attempts",
+                style: theme.textTheme.titleMedium?.copyWith(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+            const SizedBox(height: 24),
+            TextField(
+              controller: _userInput1Controller,
+              focusNode: _input1FocusNode,
+              decoration: InputDecoration(
+                labelText: 'Your first word guess',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _userInput2Controller,
+              focusNode: _input2FocusNode,
+              decoration: InputDecoration(
+                labelText: 'Your second word guess',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 32),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: theme.colorScheme.primary,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              ),
+              onPressed: () {
+                if (_userInput1Controller.text.trim().isEmpty ||
+                    _userInput2Controller.text.trim().isEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text("Please fill in both fields before submitting."),
+                    ),
+                  );
+                } else {
+                  _submitGuess();
+                }
+              },
+              child: const Text(
+                'Submit Guess',
+                style: TextStyle(fontSize: 18),
+              ),
+            ),
+            const SizedBox(height: 12),
+            ElevatedButton(
+              onPressed: hintUsedPreviously
+                  ? null
+                  : () async {
+                await _storeHintUsage();
+                setState(() {
+                  hintsUsed++;
+                  hintUsedPreviously = true;
+                  displayedSynonyms = [
+                    '${correctWords[0][1]} and ${correctWords[0][2]}',
+                    '${correctWords[1][1]} and ${correctWords[1][2]}',
+                  ];
+                });
+
+                if (GuestMode.isGuest && wordPairId != null) {
+                  await GuestProgressManager.saveProgress(
+                    wordPairId: wordPairId!,
+                    attemptsList: attemptsList,
+                    hintsUsed: hintsUsed,
+                    isSolved: false,
+                  );
+                }
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.amber.shade700,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+              child: Text(hintUsedPreviously
+                  ? 'Hint already revealed'
+                  : "I'm stuck! Give me some extra clues!"),
+            ),
+                const SizedBox(height: 12),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: theme.colorScheme.tertiary,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                  ),
+                  onPressed: () {
+                    Navigator.pushNamedAndRemoveUntil(context, '/dashboard', (route) => false);
+                  },
+                  child: const Text(
+                    'Back to Dashboard',
+                    style: TextStyle(fontSize: 18),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          floatingActionButton: FloatingActionButton(
+            onPressed: () => _showHowToPlay(context),
+            child: Icon(Icons.help_outline),
+            tooltip: 'How to Play',
+          ),
+        ),
+    );
+  }
+}
